@@ -392,7 +392,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 artist = item.get("artist", {}).get("name", "Unknown")
                 lines.append(
                     f"  ID: {item['id']} | {item.get('title', '?')} — {artist} "
-                    f"({item.get('released_at', '')[:4] if item.get('released_at') else ''})"
+                    f"({(item.get('release_date_original') or '')[:4]})"
                 )
             elif search_type == "artists":
                 lines.append(f"  ID: {item['id']} | {item.get('name', '?')}")
