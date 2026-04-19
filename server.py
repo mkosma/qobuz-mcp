@@ -341,6 +341,23 @@ async def list_tools() -> list[types.Tool]:
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
+        types.Tool(
+            name="delete_playlist",
+            description=(
+                "Delete a Qobuz playlist by ID. IRREVERSIBLE. "
+                "Use get_user_playlists first to confirm the ID."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "playlist_id": {
+                        "type": "string",
+                        "description": "Qobuz playlist ID to delete",
+                    },
+                },
+                "required": ["playlist_id"],
+            },
+        ),
     ]
 
 
@@ -502,6 +519,17 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             f"ID: {data.get('id')}\n"
             f"ISRC: {data.get('isrc', 'N/A')}"
         )
+
+    if name == "delete_playlist":
+        playlist_id = str(arguments.get("playlist_id", "")).strip()
+        if not playlist_id:
+            return text("Error: playlist_id is required.")
+        data = await _post("playlist/delete", {"playlist_id": playlist_id})
+        if "error" in data:
+            return text(f"Error: {data['error']}")
+        if data.get("status") == "success" or data == {} or "code" not in data:
+            return text(f"Deleted playlist {playlist_id}")
+        return text(f"Unexpected response: {data}")
 
     return text(f"Unknown tool: {name}")
 
