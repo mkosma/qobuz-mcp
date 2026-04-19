@@ -13,17 +13,24 @@ Provides search, playlist creation, and track management for Qobuz.
 Required environment variables:
   QOBUZ_APP_ID      - Qobuz application ID
   QOBUZ_APP_SECRET  - Qobuz application secret
-  QOBUZ_USERNAME    - Your Qobuz account email
-  QOBUZ_PASSWORD    - Your Qobuz account password
 
-To get app credentials, you can use credentials from open-source projects
-like streamrip, or register at https://www.qobuz.com/us-en/application/form
+Authentication (in priority order):
+  1. Token file at ~/.qobuz-mcp/token.json (auto-refreshed via refresh_token.py)
+  2. QOBUZ_USER_AUTH_TOKEN + QOBUZ_USER_ID env vars
+  3. QOBUZ_USERNAME + QOBUZ_PASSWORD (broken since ~April 2026)
+
+When a request returns 401, the server auto-runs refresh_token.py to fetch a
+fresh token from the persistent browser session, then retries.
 """
 
 import asyncio
 import hashlib
+import json
 import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import httpx
 from mcp.server import Server
@@ -38,9 +45,32 @@ APP_SECRET = os.environ.get("QOBUZ_APP_SECRET", "")
 USERNAME = os.environ.get("QOBUZ_USERNAME", "")
 PASSWORD = os.environ.get("QOBUZ_PASSWORD", "")
 
-# Cached auth token and user id
-_auth_token: str = ""
-_user_id: str = ""
+TOKEN_FILE = Path.home() / ".qobuz-mcp" / "token.json"
+REFRESH_SCRIPT = Path(__file__).parent / "refresh_token.py"
+UV_BIN = "/opt/homebrew/bin/uv"
+
+_auth_token: str = os.environ.get("QOBUZ_USER_AUTH_TOKEN", "")
+_user_id: str = os.environ.get("QOBUZ_USER_ID", "")
+
+
+def _load_token_file() -> bool:
+    """Load token from disk if present and newer/different than current."""
+    global _auth_token, _user_id, APP_ID
+    if not TOKEN_FILE.exists():
+        return False
+    try:
+        data = json.loads(TOKEN_FILE.read_text())
+        _auth_token = data.get("user_auth_token", "") or _auth_token
+        _user_id = str(data.get("user_id", "")) or _user_id
+        APP_ID = data.get("app_id", "") or APP_ID
+        return bool(_auth_token and _user_id)
+    except Exception as e:
+        print(f"Failed to load token file: {e}", file=sys.stderr)
+        return False
+
+
+# Prefer token file over env vars (it's auto-refreshed)
+_load_token_file()
 
 
 def text(s: str) -> list[types.TextContent]:
@@ -52,21 +82,41 @@ def _request_sig(endpoint_path: str, params: dict, ts: int) -> str:
     Build the HMAC-style request signature Qobuz needs for some endpoints.
     sig = md5(endpoint_path_no_slashes + sorted_params_values + ts + app_secret)
     """
-    # Strip leading slash and replace remaining with empty
     path = endpoint_path.lstrip("/").replace("/", "")
     sorted_vals = "".join(str(v) for _, v in sorted(params.items()) if v)
     raw = f"{path}{sorted_vals}{ts}{APP_SECRET}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-async def _login() -> tuple[bool, str]:
-    """Authenticate and cache the token. Returns (success, error_msg)."""
-    global _auth_token, _user_id
-    if not all([APP_ID, APP_SECRET, USERNAME, PASSWORD]):
-        return False, (
-            "Missing credentials. Set QOBUZ_APP_ID, QOBUZ_APP_SECRET, "
-            "QOBUZ_USERNAME, QOBUZ_PASSWORD environment variables."
+async def _refresh_token() -> tuple[bool, str]:
+    """Run refresh_token.py to get a new token. Returns (success, message)."""
+    if not REFRESH_SCRIPT.exists():
+        return False, f"Refresh script not found at {REFRESH_SCRIPT}"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            UV_BIN, "run", str(REFRESH_SCRIPT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return False, "Refresh script timed out (60s)"
+        if proc.returncode != 0:
+            return False, f"Refresh failed: {stderr.decode()[:500]}"
+        if not _load_token_file():
+            return False, "Refresh ran but token file missing/invalid"
+        return True, "Token refreshed"
+    except Exception as e:
+        return False, f"Refresh error: {e}"
+
+
+async def _password_login() -> tuple[bool, str]:
+    """Legacy password login. Broken since ~April 2026."""
+    global _auth_token, _user_id
+    if not all([APP_ID, USERNAME, PASSWORD]):
+        return False, "No credentials for password login"
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
@@ -81,8 +131,7 @@ async def _login() -> tuple[bool, str]:
             )
             data = resp.json()
             if "user_auth_token" not in data:
-                msg = data.get("message", str(data))
-                return False, f"Login failed: {msg}"
+                return False, f"Login failed: {data.get('message', str(data))}"
             _auth_token = data["user_auth_token"]
             _user_id = str(data["user"]["id"])
             return True, ""
@@ -91,15 +140,34 @@ async def _login() -> tuple[bool, str]:
 
 
 async def _ensure_auth() -> tuple[bool, str]:
-    """Ensure we have a valid auth token, logging in if needed."""
-    global _auth_token
-    if _auth_token:
+    """Ensure we have a valid auth token, refreshing or logging in if needed."""
+    if _auth_token and _user_id:
         return True, ""
-    return await _login()
+    if TOKEN_FILE.exists() and _load_token_file():
+        return True, ""
+    ok, msg = await _refresh_token()
+    if ok:
+        return True, ""
+    if USERNAME and PASSWORD:
+        return await _password_login()
+    return False, (
+        "No auth token available. Run: uv run refresh_token.py --login "
+        f"(refresh attempt: {msg})"
+    )
 
 
-async def _get(endpoint: str, params: dict | None = None, signed: bool = False) -> dict:
-    """Make an authenticated GET request to the Qobuz API."""
+def _is_auth_error(data: dict) -> bool:
+    """Detect Qobuz 401-style auth errors in JSON responses."""
+    if data.get("code") == 401:
+        return True
+    msg = str(data.get("message", "")).lower()
+    return "authentication" in msg or "auth_required" in msg
+
+
+async def _request(method: str, endpoint: str, params: dict | None = None,
+                   data: dict | None = None, signed: bool = False,
+                   _retried: bool = False) -> dict:
+    """Make an authenticated request, auto-refreshing on 401."""
     ok, err = await _ensure_auth()
     if not ok:
         return {"error": err}
@@ -110,38 +178,36 @@ async def _get(endpoint: str, params: dict | None = None, signed: bool = False) 
         p["request_ts"] = ts
         p["request_sig"] = _request_sig(endpoint, p, ts)
     headers = {"X-User-Auth-Token": _auth_token, "X-App-Id": APP_ID}
+    url = f"{QOBUZ_BASE}/{endpoint.lstrip('/')}"
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(
-                f"{QOBUZ_BASE}/{endpoint.lstrip('/')}",
-                params=p,
-                headers=headers,
-                timeout=20,
-            )
-            return resp.json()
+            if method == "GET":
+                resp = await client.get(url, params=p, headers=headers, timeout=20)
+            else:
+                d = dict(data or {})
+                d["app_id"] = APP_ID
+                resp = await client.post(url, params=p, data=d, headers=headers, timeout=20)
+            result = resp.json()
         except Exception as e:
             return {"error": str(e)}
+
+    if _is_auth_error(result) and not _retried:
+        global _auth_token
+        _auth_token = ""  # force refresh
+        ok, msg = await _refresh_token()
+        if ok:
+            return await _request(method, endpoint, params, data, signed, _retried=True)
+        return {"error": f"Auth failed and refresh unsuccessful: {msg}"}
+
+    return result
+
+
+async def _get(endpoint: str, params: dict | None = None, signed: bool = False) -> dict:
+    return await _request("GET", endpoint, params=params, signed=signed)
 
 
 async def _post(endpoint: str, data: dict | None = None) -> dict:
-    """Make an authenticated POST request to the Qobuz API."""
-    ok, err = await _ensure_auth()
-    if not ok:
-        return {"error": err}
-    d = dict(data or {})
-    d["app_id"] = APP_ID
-    headers = {"X-User-Auth-Token": _auth_token, "X-App-Id": APP_ID}
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post(
-                f"{QOBUZ_BASE}/{endpoint.lstrip('/')}",
-                data=d,
-                headers=headers,
-                timeout=20,
-            )
-            return resp.json()
-        except Exception as e:
-            return {"error": str(e)}
+    return await _request("POST", endpoint, data=data)
 
 
 @server.list_tools()
@@ -261,9 +327,17 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="qobuz_login",
             description=(
-                "Authenticate with Qobuz and cache the session token. "
-                "Called automatically on first use, but you can call this "
-                "explicitly to test credentials."
+                "Authenticate with Qobuz. Loads token from ~/.qobuz-mcp/token.json, "
+                "or runs refresh_token.py to fetch one. Auto-called on first use."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="qobuz_refresh_token",
+            description=(
+                "Force-refresh the Qobuz auth token by running the headless "
+                "browser refresh script. Use when search/playback is failing "
+                "with auth errors."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
@@ -274,10 +348,20 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     if name == "qobuz_login":
-        ok, err = await _login()
+        ok, err = await _ensure_auth()
         if ok:
-            return text(f"Logged in successfully. User ID: {_user_id}")
+            return text(f"Authenticated. User ID: {_user_id}")
         return text(f"Login failed: {err}")
+
+    if name == "qobuz_refresh_token":
+        ok, msg = await _refresh_token()
+        if ok:
+            return text(f"Token refreshed. User ID: {_user_id}")
+        return text(
+            f"Refresh failed: {msg}\n\n"
+            "If this is the first run or your saved session has expired, "
+            "run manually: uv run refresh_token.py --login"
+        )
 
     if name == "qobuz_search":
         query = arguments.get("query", "").strip()
