@@ -168,6 +168,7 @@ async def _request(method: str, endpoint: str, params: dict | None = None,
                    data: dict | None = None, signed: bool = False,
                    _retried: bool = False) -> dict:
     """Make an authenticated request, auto-refreshing on 401."""
+    global _auth_token
     ok, err = await _ensure_auth()
     if not ok:
         return {"error": err}
@@ -192,7 +193,6 @@ async def _request(method: str, endpoint: str, params: dict | None = None,
             return {"error": str(e)}
 
     if _is_auth_error(result) and not _retried:
-        global _auth_token
         _auth_token = ""  # force refresh
         ok, msg = await _refresh_token()
         if ok:
